@@ -9,10 +9,14 @@ import (
 	"os"
 	"time"
 
+	"errors"
 	"net/http"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
+
+	"path/filepath" // For joining paths
 
 	"cloud.google.com/go/storage"
 	"github.com/google/uuid"
@@ -22,14 +26,21 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	// Assuming the generated proto path, adjust if different
 	statsService "main/internal/v2rayapi/stats/command"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
-// Global variables
+// Global variables & Configuration
 var (
 	currentUsersConfig UsersConfig
 	configMutex        = &sync.RWMutex{}
 	v2rayCmd           *exec.Cmd
 	v2rayRestartMutex  = &sync.Mutex{}
+
+	// Admin credentials and JWT secret
+	adminUsername  string
+	adminPassword  string
+	jwtSecretKey []byte
 )
 
 // V2Ray related structures
@@ -372,7 +383,101 @@ func startTrafficMonitoringLoop(grpcApiAddress string, checkInterval time.Durati
 
 // --- HTTP Handlers ---
 
-// --- HTTP Handlers ---
+// generateJWT creates a new JWT for the given username.
+func generateJWT(username string) (string, error) {
+	claims := jwt.MapClaims{
+		"username": username,
+		"exp":      time.Now().Add(time.Hour * 24).Unix(), // Token expires in 24 hours
+		"iat":      time.Now().Unix(),
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signedToken, err := token.SignedString(jwtSecretKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to sign token: %v", err)
+	}
+	return signedToken, nil
+}
+
+type LoginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONResponse(w, http.StatusMethodNotAllowed, map[string]string{"error": "Only POST method is allowed"})
+		return
+	}
+
+	var req LoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONResponse(w, http.StatusBadRequest, map[string]string{"error": "Invalid request body: " + err.Error()})
+		return
+	}
+
+	// Check credentials
+	if req.Username == adminUsername && req.Password == adminPassword {
+		tokenString, err := generateJWT(req.Username)
+		if err != nil {
+			log.Printf("ERROR: Failed to generate JWT: %v", err)
+			writeJSONResponse(w, http.StatusInternalServerError, map[string]string{"error": "Failed to generate token"})
+			return
+		}
+		writeJSONResponse(w, http.StatusOK, map[string]string{"token": tokenString})
+	} else {
+		writeJSONResponse(w, http.StatusUnauthorized, map[string]string{"error": "Invalid username or password"})
+	}
+}
+
+// jwtAuthMiddleware validates the JWT token from the Authorization header.
+func jwtAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			writeJSONResponse(w, http.StatusUnauthorized, map[string]string{"error": "Authorization header required"})
+			return
+		}
+
+		bearerToken := strings.Split(authHeader, " ")
+		if len(bearerToken) != 2 || strings.ToLower(bearerToken[0]) != "bearer" {
+			writeJSONResponse(w, http.StatusUnauthorized, map[string]string{"error": "Invalid token format; expected 'Bearer <token>'"})
+			return
+		}
+
+		tokenString := bearerToken[1]
+		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+			// Check the signing method
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+			}
+			return jwtSecretKey, nil
+		})
+
+		if err != nil {
+			log.Printf("Token validation error: %v", err)
+			errorMsg := "Invalid token"
+			if errors.Is(err, jwt.ErrTokenExpired) {
+				errorMsg = "Token has expired"
+			} else if errors.Is(err, jwt.ErrTokenNotValidYet) {
+				errorMsg = "Token not valid yet"
+			}
+			writeJSONResponse(w, http.StatusUnauthorized, map[string]string{"error": errorMsg})
+			return
+		}
+
+		if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+			// Optionally, add claims to context for later handlers
+			// For example: username := claims["username"].(string)
+			// ctx := context.WithValue(r.Context(), "username", username)
+			// next.ServeHTTP(w, r.WithContext(ctx))
+			log.Printf("Authenticated user: %s", claims["username"])
+			next.ServeHTTP(w, r)
+		} else {
+			writeJSONResponse(w, http.StatusUnauthorized, map[string]string{"error": "Invalid token claims"})
+		}
+	})
+}
 
 func writeJSONResponse(w http.ResponseWriter, statusCode int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -572,38 +677,23 @@ func deleteUserHandler(gcsBucket, gcsObject, v2rayPort string) http.HandlerFunc 
 }
 
 func main() {
-	bucketName := os.Getenv("GCS_BUCKET_NAME")
-	objectName := os.Getenv("GCS_OBJECT_NAME")
-
-	if bucketName == "" || objectName == "" {
-		log.Fatal("GCS_BUCKET_NAME and GCS_OBJECT_NAME environment variables must be set")
+	// Initialize admin credentials and JWT secret key first
+	adminUsername = os.Getenv("ADMIN_USERNAME")
+	if adminUsername == "" {
+		adminUsername = "admin"
+		log.Println("ADMIN_USERNAME not set, using default 'admin'")
 	}
-
-	log.Printf("Loading users from gs://%s/%s", bucketName, objectName)
-	users, err := loadUsersConfig(bucketName, objectName)
-	if err != nil {
-		log.Fatalf("Failed to load users config: %v", err)
+	adminPassword = os.Getenv("ADMIN_PASSWORD")
+	if adminPassword == "" {
+		adminPassword = "password" // In a real scenario, use a strong, non-default password
+		log.Println("ADMIN_PASSWORD not set, using default 'password'. THIS IS INSECURE.")
 	}
-	log.Printf("Loaded %d users", len(users))
-
-	// Add a test user
-	testUserID := uuid.NewString()
-	users[testUserID] = User{
-		ID:             testUserID,
-		TrafficLimitGB: 10,
-		TimeLimitDays:  30,
-		CreatedAt:      time.Now(),
-		IsActive:       true,
+	jwtSecretKeyStr := os.Getenv("JWT_SECRET_KEY")
+	if jwtSecretKeyStr == "" {
+		log.Fatal("FATAL: JWT_SECRET_KEY environment variable must be set.")
 	}
-	log.Printf("Added test user: %s", testUserID)
+	jwtSecretKey = []byte(jwtSecretKeyStr)
 
-	log.Printf("Saving users to gs://%s/%s", bucketName, objectName)
-	if err := saveUsersConfig(bucketName, objectName, users); err != nil {
-		log.Fatalf("Failed to save users config: %v", err)
-	}
-	log.Println("Successfully saved users config.")
-
-	// Get GCS and V2Ray port details from environment
 	gcsBucketName := os.Getenv("GCS_BUCKET_NAME")
 	gcsObjectName := os.Getenv("GCS_OBJECT_NAME")
 	v2rayPort := os.Getenv("PORT") // PORT is for V2Ray service itself
@@ -640,21 +730,30 @@ func main() {
 		log.Printf("API_PORT environment variable not set, using default %s", apiPort)
 	}
 
-	// Using standard http.ServeMux and http.HandleFunc with closures
+	// Using standard http.ServeMux
 	mux := http.NewServeMux()
-	mux.HandleFunc("/users", func(w http.ResponseWriter, r *http.Request) {
+
+	// --- Public routes ---
+	mux.HandleFunc("/api/auth/login", loginHandler)
+
+	// --- Protected User Management API routes ---
+	// Wrap existing handlers with method dispatching and JWT auth
+
+	// Handler for /api/users
+	usersAPIHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			getUsersHandler(w, r)
 		case http.MethodPost:
 			createUserHandler(gcsBucketName, gcsObjectName, v2rayPort)(w, r)
 		default:
-			writeJSONResponse(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
+			writeJSONResponse(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed for /api/users"})
 		}
 	})
-	// For specific user, expecting /user?id=xxx
-	// A more RESTful approach would be /users/{id}, requiring gorilla/mux or similar
-	mux.HandleFunc("/user", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/users", jwtAuthMiddleware(usersAPIHandler))
+
+	// Handler for /api/user (e.g., /api/user?id=...)
+	userAPIHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			getUserHandler(w, r)
@@ -663,14 +762,16 @@ func main() {
 		case http.MethodDelete:
 			deleteUserHandler(gcsBucketName, gcsObjectName, v2rayPort)(w, r)
 		default:
-			writeJSONResponse(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
+			writeJSONResponse(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed for /api/user"})
 		}
 	})
+	mux.Handle("/api/user", jwtAuthMiddleware(userAPIHandler))
 
 	log.Printf("Starting API server on port %s", apiPort)
-	if err := http.ListenAndServe(":"+apiPort, mux); err != nil {
-		log.Fatalf("Failed to start API server: %v", err)
-	}
+	// The http.Server is started further down, after initializing traffic monitoring.
+	// This is a bit mixed up, let's ensure ListenAndServe is called once.
+	// The previous structure had ListenAndServe then traffic monitoring init.
+	// For clarity, server setup should be together.
 
 	// Define V2Ray gRPC API address and traffic check interval
 	v2rayGrpcApiAddress := "127.0.0.1:10085" // As configured in generateV2RayConfig
@@ -688,11 +789,48 @@ func main() {
 	// Start traffic monitoring loop
 	go startTrafficMonitoringLoop(v2rayGrpcApiAddress, trafficCheckInterval, gcsBucketName, gcsObjectName, v2rayPort)
 
-	log.Printf("Starting API server on port %s", apiPort)
+	// --- Serve Static UI Files ---
+	uiStaticDir := "/app/ui_static_files" // Path where UI files are copied in Dockerfile
+
+	// Handle /ui/ path for serving static files and SPA routing
+	mux.HandleFunc("/ui/", func(w http.ResponseWriter, r *http.Request) {
+		// Construct the path to the file in the filesystem
+		filePath := filepath.Join(uiStaticDir, strings.TrimPrefix(r.URL.Path, "/ui/"))
+
+		// Check if the file exists
+		stat, err := os.Stat(filePath)
+		if os.IsNotExist(err) || stat.IsDir() {
+			// File does not exist or it's a directory: serve index.html for SPA routing
+			http.ServeFile(w, r, filepath.Join(uiStaticDir, "index.html"))
+			return
+		} else if err != nil {
+			// Other error (e.g., permission issues)
+			log.Printf("Error accessing static file %s: %v", filePath, err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		// File exists and is not a directory, serve it
+		http.ServeFile(w, r, filePath)
+	})
+
+	// Redirect root path "/" to "/ui/"
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			http.Redirect(w, r, "/ui/", http.StatusFound)
+		} else {
+			// If path is not "/", "/ui/*" or "/api/*", it's a 404.
+			// ServeMux handles this by default if no other pattern matches.
+			// However, if /api/ was not handled by a sub-router or more specific patterns,
+			// this could inadvertently catch /api requests. But current setup is fine.
+			http.NotFound(w,r)
+		}
+	})
+
+	// Start the HTTP server (this will be the final blocking call in main)
+	log.Printf("API server and UI listening on :%s", apiPort)
 	if err := http.ListenAndServe(":"+apiPort, mux); err != nil {
-		log.Fatalf("Failed to start API server: %v", err)
+		log.Fatalf("Failed to start server: %v", err)
 	}
-	// ListenAndServe is blocking, so main goroutine will stay alive.
 }
 
 // generateV2RayConfig creates a V2Ray JSON configuration.
@@ -705,7 +843,7 @@ func generateV2RayConfig(users UsersConfig, port string) ([]byte, error) {
 		if user.IsActive {
 			v2rayClients = append(v2rayClients, Client{
 				ID:      user.ID,
-				AlterID: 0, // Standard AlterID for VMess
+				// AlterID: 0, // Not used by VLESS
 				Email:   "user_" + user.ID, // Tag for stats: "user_UUID"
 				Level:   userLevel,
 			})
@@ -718,11 +856,11 @@ func generateV2RayConfig(users UsersConfig, port string) ([]byte, error) {
 		defaultUserID := uuid.NewString()
 		v2rayClients = append(v2rayClients, Client{
 			ID:      defaultUserID,
-			AlterID: 0,
+			// AlterID: 0, // Not used by VLESS
 			Email:   "user_" + defaultUserID, // Consistent email format for stats
 			Level:   userLevel, // Use the defined userLevel
 		})
-		log.Printf("Default user ID: %s, Email for stats: user_%s", defaultUserID, defaultUserID)
+		log.Printf("Default VLESS user ID: %s, Email for stats: user_%s", defaultUserID, defaultUserID)
 	} else {
 		log.Printf("Using %d active user(s) for V2Ray config.", len(v2rayClients))
 	}
@@ -765,18 +903,19 @@ func generateV2RayConfig(users UsersConfig, port string) ([]byte, error) {
 		Inbounds: []Inbound{
 			{
 				Port:     port,
-				Protocol: "vmess",
+				Protocol: "vless", // Changed from vmess to vless
 				Settings: InboundSettings{
-					Clients: v2rayClients,
+					Clients:    v2rayClients,
+					Decryption: "none", // Required for VLESS
 				},
 				StreamSettings: StreamSettings{
 					Network:  "ws",
-					Security: "none", // TLS is handled by Cloud Run
+					Security: "none", // TLS is typically handled by Cloud Run or a reverse proxy
 					WSSettings: WebSocketSettings{
-						Path: "/ws", // Standard WebSocket path
+						Path: "/v2ray", // Changed WebSocket path for VLESS
 					},
 				},
-				Tag: "vmess-in", // Main inbound for user traffic
+				Tag: "vless-in", // Main inbound for user traffic
 			},
 			{ // Inbound for V2Ray API
 				Port:     "10085", // Local port for API
